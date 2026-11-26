@@ -1,0 +1,13 @@
+.DS_Store
+artifacts/
+logs/
+tmp/
+.env
+.env.*
+*.secret
+*.token
+*.tokens
+*.key
+*.pem
+node_modules/
+.deploy-coordinator/

@@ -1,0 +1,14 @@
+{
+  "tiny": {
+    "maxTokens": 4000
+  },
+  "normal": {
+    "maxTokens": 12000
+  },
+  "noisyWorker": {
+    "maxTokens": 8000
+  },
+  "review": {
+    "maxTokens": 12000
+  }
+}

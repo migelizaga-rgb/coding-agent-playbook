@@ -1,0 +1,438 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const cp = require('node:child_process');
+
+const MAX_CURRENT_BYTES = 3500;
+
+function die(message, code = 1) {
+  process.stderr.write(`agent-handoff: ${message}\n`);
+  process.exit(code);
+}
+
+function ensureDir(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function writeAtomic(filePath, content) {
+  ensureDir(path.dirname(filePath));
+  const tmp = `${filePath}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, content, 'utf8');
+  fs.renameSync(tmp, filePath);
+}
+
+function readFileIfExists(filePath) {
+  try {
+    return fs.readFileSync(filePath, 'utf8');
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+function gitRoot(cwd) {
+  try {
+    const out = cp.execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return out.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function resolvePaths(cwd = process.cwd()) {
+  const repo = gitRoot(cwd);
+  const root = repo || path.resolve(cwd);
+  return {
+    repo: root,
+    currentPath: path.join(root, 'handoff.md'),
+    checkpointDir: path.join(root, 'docs/handoff/checkpoints'),
+  };
+}
+
+function gitValue(paths, args) {
+  if (!paths.repo) return '';
+  try {
+    return cp.execFileSync('git', ['-C', paths.repo, ...args], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return '';
+  }
+}
+
+function currentIdentity(paths, flags = {}, taskFallback = '') {
+  const branch = gitValue(paths, ['branch', '--show-current']) || 'detached';
+  const worktree = paths.repo || process.cwd();
+  return {
+    task: flag(flags, 'task', taskFallback || process.env.CODEX_THREAD_ID || branch || path.basename(worktree)),
+    branch,
+    worktree,
+    headSha: gitValue(paths, ['rev-parse', 'HEAD']) || 'none',
+  };
+}
+
+function handoffFreshnessWarning(fields, identity) {
+  if (!fields.Task || !fields.Branch || !fields.Worktree || !fields['Head SHA']) {
+    return '[LEGACY HANDOFF: task/branch/worktree/HEAD identity missing; verify relevance and run start before mutation]\n';
+  }
+  const checks = [
+    [path.resolve(fields.Worktree) !== path.resolve(identity.worktree), `worktree ${fields.Worktree}`],
+    [fields.Branch !== identity.branch, `branch ${fields.Branch}`],
+    [fields.Task !== identity.task, `task ${fields.Task}`],
+    [fields['Head SHA'] !== identity.headSha, `HEAD ${fields['Head SHA']}`],
+  ];
+  const mismatch = checks.find(([different]) => different);
+  if (!mismatch) return '';
+  return `[STALE HANDOFF: belongs to ${mismatch[1]}; current is task ${identity.task}, branch ${identity.branch}, worktree ${identity.worktree}, HEAD ${identity.headSha}]\n`;
+}
+
+function parseArgs(argv) {
+  const command = argv[2] || 'help';
+  const flags = {};
+  const rest = argv.slice(3);
+  for (let i = 0; i < rest.length; i += 1) {
+    const token = rest[i];
+    if (!token.startsWith('--')) {
+      if (!flags._) flags._ = [];
+      flags._.push(token);
+      continue;
+    }
+    const key = token.slice(2);
+    const next = rest[i + 1];
+    const value = next && !next.startsWith('--') ? rest[++i] : true;
+    if (Object.prototype.hasOwnProperty.call(flags, key)) {
+      if (!Array.isArray(flags[key])) flags[key] = [flags[key]];
+      flags[key].push(value);
+    } else {
+      flags[key] = value;
+    }
+  }
+  return { command, flags };
+}
+
+function asArray(value) {
+  if (value === undefined || value === null || value === true) return [];
+  return Array.isArray(value) ? value.map(String) : [String(value)];
+}
+
+function evidenceItems(value) {
+  return asArray(value)
+    .map((item) => item.trim())
+    .filter((item) => item && item.toLowerCase() !== 'none');
+}
+
+function flag(flags, name, fallback = '') {
+  const value = flags[name];
+  if (Array.isArray(value)) return String(value[value.length - 1] || fallback).trim();
+  if (value === undefined || value === null || value === true) return fallback;
+  return String(value).trim();
+}
+
+function splitCsv(value) {
+  if (!value) return [];
+  return String(value).split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function slugify(value) {
+  const slug = String(value || 'checkpoint')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+  return slug || 'checkpoint';
+}
+
+function rel(paths, filePath) {
+  if (!paths.repo) return filePath;
+  return path.relative(paths.repo, filePath);
+}
+
+function uniqueFilePath(filePath) {
+  if (!fs.existsSync(filePath)) return filePath;
+  const dir = path.dirname(filePath);
+  const ext = path.extname(filePath);
+  const base = path.basename(filePath, ext);
+  for (let i = 2; i < 1000; i += 1) {
+    const candidate = path.join(dir, `${base}-${i}${ext}`);
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+  die(`could not allocate unique checkpoint path for ${filePath}`);
+}
+
+function parseCurrent(content) {
+  const fields = {};
+  if (!content) return fields;
+  for (const key of ['Last updated', 'Status', 'Owner', 'Task', 'Branch', 'Worktree', 'Head SHA', 'Objective', 'Spec', 'Current checkpoint', 'Next action']) {
+    const re = new RegExp(`^${key}:\\s*(.*)$`, 'mi');
+    const match = content.match(re);
+    if (match) fields[key] = match[1].trim();
+  }
+  const checkpointMatch = content.match(/^## Checkpoints\s*\n([\s\S]*)$/m);
+  if (checkpointMatch) {
+    fields.checkpoints = checkpointMatch[1]
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith('- '));
+  }
+  return fields;
+}
+
+function bulletLines(items, fallback = 'none') {
+  const rows = (items || []).map((item) => String(item).trim()).filter(Boolean);
+  if (rows.length === 0) return `- ${fallback}`;
+  return rows.map((item) => `- ${item}`).join('\n');
+}
+
+function renderCurrent(data) {
+  const checkpoints = (data.checkpoints || []).slice(-8);
+  return `# Agent Handoff - Current
+
+Last updated: ${data.updatedAt}
+Status: ${data.status || 'active'}
+Owner: ${data.owner || 'unknown'}
+Task: ${data.task || 'unknown'}
+Branch: ${data.branch || 'unknown'}
+Worktree: ${data.worktree || 'unknown'}
+Head SHA: ${data.headSha || 'none'}
+Objective: ${data.objective || 'none'}
+Spec: ${data.spec || 'none'}
+Current checkpoint: ${data.currentCheckpoint || 'started'}
+Next action: ${data.nextAction || 'none'}
+
+## State
+${bulletLines(data.state)}
+
+## Touched Files
+${bulletLines(data.files)}
+
+## Risks / Blockers
+${bulletLines(data.risks)}
+
+## Resume Rules
+- Read the linked spec before implementation if \`Spec\` is not \`none\`.
+- Read checkpoint history only if the current checkpoint is not enough.
+- Write the next handoff only at a lifecycle checkpoint.
+
+## Checkpoints
+${checkpoints.length ? checkpoints.join('\n') : '- none'}
+`;
+}
+
+function writeCurrent(paths, data) {
+  const rendered = renderCurrent(data);
+  const bytes = Buffer.byteLength(rendered, 'utf8');
+  if (bytes > MAX_CURRENT_BYTES) {
+    die(`current handoff exceeds ${MAX_CURRENT_BYTES} bytes (${bytes}); move detail to a checkpoint`);
+  }
+  writeAtomic(paths.currentPath, rendered);
+  return rendered;
+}
+
+function checkpointContent({ iso, owner, task, branch, worktree, headSha, objective, milestone, spec, completed, decisions, evidence, files, risks, nextAction }) {
+  return `# Agent Handoff Checkpoint
+
+Date: ${iso}
+Agent: ${owner || 'unknown'}
+Task: ${task || 'unknown'}
+Branch: ${branch || 'unknown'}
+Worktree: ${worktree || 'unknown'}
+Head SHA: ${headSha || 'none'}
+Objective: ${objective || 'none'}
+Milestone: ${milestone}
+Spec: ${spec || 'none'}
+
+## Completed
+${bulletLines(completed)}
+
+## Decisions
+${bulletLines(decisions)}
+
+## Evidence
+${bulletLines(evidence)}
+
+## Files Touched
+${bulletLines(files)}
+
+## Risks / Blockers
+${bulletLines(risks)}
+
+## Next Action
+${bulletLines([nextAction || 'none'])}
+`;
+}
+
+function cmdRead() {
+  const paths = resolvePaths();
+  const content = readFileIfExists(paths.currentPath);
+  if (!content) {
+    process.stdout.write(`No agent handoff found at ${rel(paths, paths.currentPath)}\n`);
+    return;
+  }
+  const fields = parseCurrent(content);
+  const identity = currentIdentity(paths);
+  process.stdout.write(handoffFreshnessWarning(fields, identity));
+  process.stdout.write(content);
+}
+
+function cmdStart(flags) {
+  const paths = resolvePaths();
+  const iso = new Date().toISOString();
+  const objective = flag(flags, 'objective');
+  if (!objective) die('start requires --objective "..."');
+  const spec = flag(flags, 'spec', 'none');
+  const owner = flag(flags, 'agent', flag(flags, 'owner', 'unknown'));
+  const nextAction = flag(flags, 'next', 'none');
+  const status = flag(flags, 'status', 'active');
+  const identity = currentIdentity(paths, flags);
+  const checkpoint = `${iso} - started - ${spec !== 'none' ? spec : 'inline note'}`;
+  const rendered = writeCurrent(paths, {
+    updatedAt: iso,
+    status,
+    owner,
+    ...identity,
+    objective,
+    spec,
+    currentCheckpoint: 'started',
+    nextAction,
+    state: ['Compact cross-agent handoff initialized.'],
+    files: splitCsv(flag(flags, 'files')),
+    risks: splitCsv(flag(flags, 'risks')),
+    checkpoints: [`- ${checkpoint}`],
+  });
+  process.stdout.write(rendered);
+}
+
+function cmdCheckpoint(flags) {
+  const paths = resolvePaths();
+  const current = readFileIfExists(paths.currentPath);
+  const fields = parseCurrent(current);
+  if (!current || !fields.Task || !fields.Branch || !fields.Worktree) {
+    die('current handoff has no task identity; run start before checkpoint');
+  }
+  const requestedTask = flag(flags, 'task');
+  if (requestedTask && requestedTask !== fields.Task) die(`current handoff belongs to task ${fields.Task}; run start before switching to ${requestedTask}`);
+  const identity = currentIdentity(paths, {}, fields.Task);
+  if (fields.Worktree && path.resolve(fields.Worktree) !== path.resolve(identity.worktree)) {
+    die(`current handoff belongs to worktree ${fields.Worktree}; run start in ${identity.worktree} before checkpoint`);
+  }
+  if (fields.Branch && fields.Branch !== identity.branch) {
+    die(`current handoff belongs to branch ${fields.Branch}; run start on ${identity.branch} before checkpoint`);
+  }
+  const iso = new Date().toISOString();
+  const milestone = flag(flags, 'milestone');
+  if (!milestone) die('checkpoint requires --milestone "..."');
+  const owner = flag(flags, 'agent', fields.Owner || 'unknown');
+  const objective = flag(flags, 'objective', fields.Objective || 'none');
+  const spec = flag(flags, 'spec', fields.Spec || 'none');
+  const status = flag(flags, 'status', fields.Status || 'active');
+  const nextAction = flag(flags, 'next', fields['Next action'] || 'none');
+  const files = splitCsv(flag(flags, 'files'));
+  const risks = splitCsv(flag(flags, 'risks'));
+  const evidence = evidenceItems(flags.evidence);
+  if (evidence.length === 0) die('checkpoint requires at least one --evidence "..."');
+  const decisions = asArray(flags.decision);
+  const completed = [status].filter(Boolean);
+  const slug = `${iso.slice(0, 10)}-${slugify(milestone)}.md`;
+  const checkpointPath = uniqueFilePath(path.join(paths.checkpointDir, slug));
+  writeAtomic(checkpointPath, checkpointContent({
+    iso,
+    owner,
+    ...identity,
+    objective,
+    milestone,
+    spec,
+    completed,
+    decisions,
+    evidence,
+    files,
+    risks,
+    nextAction,
+  }));
+  const checkpointLine = `- ${iso} - ${milestone} - ${rel(paths, checkpointPath)}`;
+  const checkpoints = [...(fields.checkpoints || []).filter((line) => line !== '- none'), checkpointLine];
+  writeCurrent(paths, {
+    updatedAt: iso,
+    status,
+    owner,
+    ...identity,
+    objective,
+    spec,
+    currentCheckpoint: milestone,
+    nextAction,
+    state: [`${milestone}: ${status}`],
+    files,
+    risks,
+    checkpoints,
+  });
+  process.stdout.write(`${rel(paths, checkpointPath)}\n`);
+}
+
+function cmdClose(flags) {
+  const paths = resolvePaths();
+  const current = readFileIfExists(paths.currentPath);
+  const fields = parseCurrent(current);
+  if (!current || !fields.Task || !fields.Branch || !fields.Worktree) {
+    die('current handoff has no task identity; run start before close');
+  }
+  const iso = new Date().toISOString();
+  const requestedTask = flag(flags, 'task');
+  if (requestedTask && requestedTask !== fields.Task) die(`current handoff belongs to task ${fields.Task}; run start before switching to ${requestedTask}`);
+  const identity = currentIdentity(paths, {}, fields.Task);
+  const evidence = evidenceItems(flags.evidence);
+  if (evidence.length === 0) die('close requires at least one --evidence "..."');
+  if (fields.Worktree && path.resolve(fields.Worktree) !== path.resolve(identity.worktree)) {
+    die(`current handoff belongs to worktree ${fields.Worktree}; run start in ${identity.worktree} before close`);
+  }
+  if (fields.Branch && fields.Branch !== identity.branch) {
+    die(`current handoff belongs to branch ${fields.Branch}; run start on ${identity.branch} before close`);
+  }
+  writeCurrent(paths, {
+    updatedAt: iso,
+    status: flag(flags, 'status', 'closed'),
+    owner: flag(flags, 'agent', fields.Owner || 'unknown'),
+    ...identity,
+    objective: flag(flags, 'objective', fields.Objective || 'none'),
+    spec: flag(flags, 'spec', fields.Spec || 'none'),
+    currentCheckpoint: 'closed',
+    nextAction: flag(flags, 'next', 'none'),
+    state: ['Handoff closed.', ...evidence.map((item) => `Closure evidence: ${item}`)],
+    files: [],
+    risks: [],
+    checkpoints: [...(fields.checkpoints || []).filter((line) => line !== '- none'), `- ${iso} - closed - inline note`],
+  });
+  process.stdout.write('closed\n');
+}
+
+function usage() {
+  process.stdout.write(`Usage:
+  agent-handoff read
+  agent-handoff start --objective "..." [--task id] [--spec path] [--agent name] [--status active] [--next "..."]
+  agent-handoff checkpoint --milestone "..." --evidence "command or artifact" [--task id] [--status "..."] [--next "..."] [--spec path] [--files "a,b"]
+  agent-handoff close --evidence "command or artifact" [--status closed]
+`);
+}
+
+function main() {
+  const { command, flags } = parseArgs(process.argv);
+  switch (command) {
+    case 'read': return cmdRead(flags);
+    case 'start': return cmdStart(flags);
+    case 'checkpoint': return cmdCheckpoint(flags);
+    case 'close': return cmdClose(flags);
+    case 'help':
+    case '--help':
+    case '-h':
+      return usage();
+    default:
+      usage();
+      die(`unknown command: ${command}`);
+  }
+}
+
+main();

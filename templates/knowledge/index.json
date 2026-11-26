@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "entries": [
+    { "topic": "branch-finishing", "path": "contextual/branch-finishing.md", "summary": "Finish ordinary branches and keep review, merge, and deployment decisions distinct." },
+    { "topic": "security-and-secrets", "path": "contextual/security-and-secrets.md", "summary": "Keep credentials and sensitive data out of source, logs, and handoffs." },
+    { "topic": "token-efficiency", "path": "contextual/token-efficiency.md", "summary": "Bound noisy command output and route mechanical work efficiently." }
+  ]
+}
