@@ -38,6 +38,53 @@ flowchart LR
     H --> I[Coordinator serializes deployment]
 ```
 
+## What it looks like
+
+A 401-line test run that fails once. The agent sees eight lines; the full log
+stays on disk, and the original exit code is preserved:
+
+```text
+$ bash scripts/agent-run-compact.sh --name unit-tests --tail-lines 4 -- npm test
+[agent-run] unit-tests: starting
+[agent-run] unit-tests: full log -> artifacts/agent-run/20261126T034341Z-26515-unit-tests.log
+[agent-run] unit-tests: exit=1 duration=1s log=artifacts/agent-run/20261126T034341Z-26515-unit-tests.log
+[agent-run] unit-tests: failure tail (last 4 lines)
+ok 400 - case 400
+not ok 401 - parses empty config
+  AssertionError: expected {} got undefined
+# tests 401 pass 400 fail 1
+$ echo $?
+1
+```
+
+A handoff that a different agent (or a fresh session after compaction) can
+resume from. Checkpoints refuse to record a milestone without evidence:
+
+```text
+$ agent-handoff checkpoint --milestone "Retry with jitter implemented" --status "Focused tests pass" --next "Open PR"
+agent-handoff: checkpoint requires at least one --evidence "..."
+
+$ agent-handoff checkpoint --milestone "Retry with jitter implemented" --status "Focused tests pass" \
+    --evidence "npm test -- webhook: 12/12 pass" --next "Open PR"
+$ agent-handoff read
+# Agent Handoff - Current
+
+Status: Focused tests pass
+Task: main
+Branch: main
+Head SHA: 168a62a163e5ba85e085e21bac687e3378315a06
+Objective: Add retry to webhook sender
+Current checkpoint: Retry with jitter implemented
+Next action: Open PR
+...
+## Checkpoints
+- 2026-11-26T03:43:23Z - started - inline note
+- 2026-11-26T03:43:42Z - Retry with jitter implemented - docs/handoff/checkpoints/2026-11-26-retry-with-jitter-implemented.md
+```
+
+`read` also warns when the recorded branch, worktree or HEAD no longer match the
+checkout, so a stale handoff is flagged instead of silently trusted.
+
 ## Design choices
 
 - **Tier work by effect, not file count.** A one-line approval or runtime change can be riskier than a large documentation update.
